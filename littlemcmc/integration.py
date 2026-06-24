@@ -60,6 +60,10 @@ class CpuLeapfrogIntegrator(object):
             Momentum
         """
         logp, dlogp = self._logp_dlogp_func(q)
+        # The joint log-probability is a scalar; coerce it so that a
+        # logp_dlogp_func returning a shape-(1,) array does not turn `energy`
+        # (and downstream `accept_stat` / `step_size`) into an array.
+        logp = np.asarray(logp).item()
         v = self._potential.velocity(p)
         kinetic = self._potential.energy(p, velocity=v)
         energy = kinetic - logp
@@ -113,6 +117,7 @@ class CpuLeapfrogIntegrator(object):
 
         # Half momentum step
         logp, q_new_grad = self._logp_dlogp_func(q_new)
+        logp = np.asarray(logp).item()  # joint log-prob is a scalar (see compute_state)
         p_new = p_new + dt * q_new_grad
 
         kinetic = pot.velocity_energy(p_new, v_new)

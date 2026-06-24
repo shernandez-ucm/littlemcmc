@@ -133,7 +133,15 @@ class _Process:
             # would destroy the shared memory.
             self._unpickle_step_method()
             self._trace = np.zeros([self._model_ndim, self._tune + self._draws])
-            self._point = self.start
+            # `self._point` must be a view onto the shared-memory buffer that the
+            # parent process reads each draw from (see ProcessAdapter). Writing
+            # into this view in `_write_point` is what makes computed draws
+            # visible to the parent; rebinding the name would silently freeze the
+            # chain at its starting point.
+            self._point = np.frombuffer(self._shared_point, dtype="float64").reshape(
+                (self._model_ndim,)
+            )
+            self._point[...] = self.start
             self._start_loop()
         except KeyboardInterrupt:
             pass
@@ -153,7 +161,8 @@ class _Process:
                 break
 
     def _write_point(self, point):
-        self._point = point
+        # In-place write into the shared-memory view so the parent sees the draw.
+        self._point[...] = point
 
     def _recv_msg(self):
         return self._msg_pipe.recv()

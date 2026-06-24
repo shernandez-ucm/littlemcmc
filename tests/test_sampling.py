@@ -100,6 +100,20 @@ def test_multiprocess_sampling_runs():
     )
 
 
+def test_multiprocess_samples_not_all_same():
+    # Regression test: the worker process must write each computed draw into the
+    # shared-memory buffer the parent reads. A previous bug rebound a local name
+    # instead, freezing every chain at its start point (zero variance).
+    model_ndim = 1
+    draws = 50
+    tune = 10
+    chains = 4
+    cores = 4
+    trace, stats = lmc.sample(logp_dlogp_func, model_ndim, draws, tune, chains=chains, cores=cores)
+    for chain in range(chains):
+        assert np.var(trace[chain]) > 0
+
+
 def test_hmc_recovers_1d_normal():
     model_ndim = 1
     step = lmc.HamiltonianMC(logp_dlogp_func=logp_dlogp_func, model_ndim=model_ndim)

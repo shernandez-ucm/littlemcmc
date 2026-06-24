@@ -14,6 +14,7 @@
 
 import numpy as np
 import numpy.testing as npt
+import pytest
 
 import littlemcmc as lmc
 from littlemcmc import HamiltonianMC
@@ -40,6 +41,29 @@ def test_leapfrog_reversible():
             npt.assert_allclose(state.p, start.p, rtol=1e-5)
 
 
+def test_array_valued_logp_is_coerced_to_scalar():
+    # Regression test: a logp_dlogp_func that returns a shape-(1,) log-density
+    # must not make `energy` array-valued. Previously this propagated into an
+    # array-valued `accept_stat` and `step_size`, crashing HMC on the 2nd draw.
+    def array_logp_dlogp_func(x):
+        return np.atleast_1d(-0.5 * np.dot(x, x)), -x
+
+    step = HamiltonianMC(logp_dlogp_func=array_logp_dlogp_func, model_ndim=2)
+    state = step.integrator.compute_state(np.zeros(2), np.ones(2))
+    assert np.ndim(state.energy) == 0
+    assert np.ndim(state.model_logp) == 0
+
+    state = step.integrator.step(0.1, state)
+    assert np.ndim(state.energy) == 0
+
+    # And a full HMC run with array-valued logp completes and recovers N(0, I).
+    trace, _ = lmc.sample(
+        array_logp_dlogp_func, 2, draws=500, tune=500, step=step, chains=1, cores=1
+    )
+    npt.assert_allclose(trace.mean(axis=(0, 1)), np.zeros(2), atol=0.3)
+    npt.assert_allclose(trace.std(axis=(0, 1)), np.ones(2), atol=0.3)
+
+
 def test_nuts_tuning():
     model_ndim = 1
     draws = 5
@@ -54,3 +78,41 @@ def test_nuts_tuning():
     assert not step.tune
     # FIXME revisit this test once trace object has been stabilized.
     # assert np.all(trace['step_size'][5:] == trace['step_size'][5])
+
+
+def test_hmc_jax_backend_validation():
+    with pytest.raises(ValueError):
+        HamiltonianMC(logp_dlogp_func=logp_dlogp_func, model_ndim=1, backend="cupy")
+
+
+def test_hmc_jax_backend_samples():
+    jax = pytest.importorskip("jax")
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    def jax_logp_dlogp_func(x):
+        # Standard normal: logp = -0.5 * sum(x ** 2), grad = -x.
+        return -0.5 * jnp.sum(x ** 2), -x
+
+    model_ndim = 2
+    draws = 500
+    tune = 500
+    step = lmc.HamiltonianMC(
+        logp_dlogp_func=jax_logp_dlogp_func, model_ndim=model_ndim, backend="jax"
+    )
+    trace, stats = lmc.sample(
+        logp_dlogp_func=jax_logp_dlogp_func,
+        model_ndim=model_ndim,
+        draws=draws,
+        tune=tune,
+        step=step,
+        chains=1,
+        cores=1,
+        progressbar=False,
+    )
+
+    assert trace.shape == (1, draws, model_ndim)
+    assert np.all(np.isfinite(trace))
+    # Recovered posterior should be roughly standard normal.
+    npt.assert_allclose(trace.mean(axis=(0, 1)), np.zeros(model_ndim), atol=0.2)
+    npt.assert_allclose(trace.std(axis=(0, 1)), np.ones(model_ndim), atol=0.3)
