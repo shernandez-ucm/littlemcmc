@@ -41,31 +41,32 @@ pip install git+https://github.com/shernandez-ucm/littlemcmc.git
 ## What's new in this fork
 
 This fork extends the upstream
-[`eigenfoo/littlemcmc`](https://github.com/eigenfoo/littlemcmc) with a
-JIT-compiled JAX backend for HMC and several correctness fixes.
+[`eigenfoo/littlemcmc`](https://github.com/eigenfoo/littlemcmc) with a vmapped
+multi-chain JAX HMC and several correctness fixes.
 
-### JAX backend for Hamiltonian Monte Carlo
+### Vmapped multi-chain HMC with JAX
 
-`HamiltonianMC` takes a `backend` argument. With `backend="jax"`, the entire
-leapfrog trajectory and the Metropolis accept/reject are fused into a single
-`jax.jit`-compiled function (optionally running on GPU/TPU):
+`littlemcmc.hmc_jax.sample_vmapped_chains` runs *all* chains as the batch axis of
+`jax.vmap` inside a single `jax.jit`-compiled program (`lax.scan` over draws),
+with no OS processes and no pickling — the GPU/TPU-friendly alternative to
+`lmc.sample`'s process-per-chain parallelism. A warmup phase tunes a shared step
+size (dual averaging) and a diagonal mass matrix:
 
 ```python
 import jax.numpy as jnp
-import littlemcmc as lmc
+from littlemcmc.hmc_jax import sample_vmapped_chains
 
 def logp_dlogp_func(x):
     return -0.5 * jnp.sum(x ** 2), -x   # must be JAX-traceable
 
-step = lmc.HamiltonianMC(logp_dlogp_func=logp_dlogp_func, model_ndim=2, backend="jax")
-trace, stats = lmc.sample(logp_dlogp_func, model_ndim=2, step=step)
+trace, stats = sample_vmapped_chains(logp_dlogp_func, model_ndim=2, chains=4)
 ```
 
-The JAX backend requires `jax`/`jaxlib`, a `logp_dlogp_func` that is
-JAX-traceable (built from `jax.numpy` and returning JAX arrays — *not* wrapped in
-`np.asarray`), and a diagonal mass matrix. The default `backend="numpy"` is
-unchanged, so existing NumPy / PyTorch / PyMC3 log-probability functions keep
-working as before.
+It requires `jax`/`jaxlib`, a `logp_dlogp_func` that is JAX-traceable (built from
+`jax.numpy` and returning JAX arrays — *not* wrapped in `np.asarray`), and uses a
+diagonal mass matrix. `jax` stays an optional import: nothing in the core package
+pulls it in, so existing NumPy / PyTorch / PyMC3 `HamiltonianMC` and `NUTS`
+sampling keeps working as before.
 
 ### Bug fixes
 

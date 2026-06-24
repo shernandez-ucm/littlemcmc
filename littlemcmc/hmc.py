@@ -17,9 +17,8 @@
 from typing import Callable, Tuple, Optional
 import numpy as np
 
-from .integration import IntegrationError, State
+from .integration import IntegrationError
 from .base_hmc import BaseHMC, HMCStepData, DivergenceInfo
-
 
 __all__ = ["HamiltonianMC"]
 
@@ -66,7 +65,6 @@ class HamiltonianMC(BaseHMC):
         step_rand: Optional[Callable[[float], float]] = None,
         path_length: float = 2.0,
         max_steps: int = 1024,
-        backend: str = "numpy",
     ):
         """Set up the Hamiltonian Monte Carlo sampler.
 
@@ -119,14 +117,6 @@ class HamiltonianMC(BaseHMC):
             total length to travel
         max_steps : int, default=1024
             The maximum number of leapfrog steps.
-        backend : str, default="numpy"
-            Either ``"numpy"`` (the default) or ``"jax"``. The ``"jax"`` backend
-            JIT-compiles the entire leapfrog trajectory and Metropolis
-            accept/reject with JAX/XLA, which is substantially faster on larger
-            models and can run on GPU/TPU. It requires JAX to be installed, a
-            ``logp_dlogp_func`` that is JAX-traceable (built from ``jax.numpy``
-            and returning JAX arrays -- not wrapped in ``np.asarray``), and a
-            diagonal mass matrix. See ``littlemcmc.hmc_jax`` for details.
         """
         super(HamiltonianMC, self).__init__(
             scaling=scaling,
@@ -146,23 +136,7 @@ class HamiltonianMC(BaseHMC):
         self.path_length = path_length
         self.max_steps = max_steps
 
-        if backend not in ("numpy", "jax"):
-            raise ValueError("`backend` must be 'numpy' or 'jax', got %r." % backend)
-        self.backend = backend
-        if backend == "jax":
-            from . import hmc_jax
-
-            self._jax_diag = hmc_jax.diagonal_of
-            self._jax_trajectory = hmc_jax.build_trajectory(self._logp_dlogp_func)
-
     def _hamiltonian_step(self, start: np.ndarray, p0: np.ndarray, step_size: float) -> HMCStepData:
-        if self.backend == "jax":
-            return self._hamiltonian_step_jax(start, p0, step_size)
-        return self._hamiltonian_step_numpy(start, p0, step_size)
-
-    def _hamiltonian_step_numpy(
-        self, start: np.ndarray, p0: np.ndarray, step_size: float
-    ) -> HMCStepData:
         path_length = np.random.rand() * self.path_length
         n_steps = max(1, int(path_length / step_size))
         n_steps = min(self.max_steps, n_steps)
@@ -203,73 +177,5 @@ class HamiltonianMC(BaseHMC):
             "energy": state.energy,
             "accepted": accepted,
             "model_logp": state.model_logp,
-        }
-        return HMCStepData(end, accept_stat, div_info, stats)
-
-    def _hamiltonian_step_jax(
-        self, start: np.ndarray, p0: np.ndarray, step_size: float
-    ) -> HMCStepData:
-        import jax.numpy as jnp
-
-        # Randomized path length and accept threshold are drawn with NumPy
-        # (outside the compiled region) so the existing `np.random` seeding
-        # carries over and the trajectory itself stays a pure, jittable function.
-        path_length = np.random.rand() * self.path_length
-        n_steps = max(1, int(path_length / step_size))
-        n_steps = min(self.max_steps, n_steps)
-        accept_unif = np.random.rand()
-
-        var = self._jax_diag(self.potential)
-        (
-            q_end,
-            p_end,
-            v_end,
-            grad_end,
-            energy,
-            logp,
-            energy_change,
-            accept_stat,
-            accepted,
-            diverging,
-        ) = self._jax_trajectory(
-            jnp.asarray(start.q),
-            jnp.asarray(p0),
-            jnp.asarray(start.q_grad),
-            jnp.asarray(start.model_logp),
-            jnp.asarray(start.energy),
-            jnp.asarray(step_size),
-            jnp.asarray(var),
-            jnp.asarray(n_steps, dtype=jnp.int32),
-            jnp.asarray(self.Emax),
-            jnp.asarray(accept_unif),
-        )
-
-        # Bring the proposal back to NumPy so the (NumPy) quadpotential and
-        # step-size adaptation downstream of `_astep` see ordinary arrays.
-        end = State(
-            np.asarray(q_end),
-            np.asarray(p_end),
-            np.asarray(v_end),
-            np.asarray(grad_end),
-            float(energy),
-            float(logp),
-        )
-        accepted = bool(accepted)
-        diverging = bool(diverging)
-        accept_stat = float(accept_stat)
-        energy_change = float(energy_change)
-
-        div_info = None
-        if diverging:
-            div_info = DivergenceInfo("Divergence encountered, bad energy.", None, end)
-
-        stats = {
-            "path_length": path_length,
-            "n_steps": n_steps,
-            "accept": accept_stat,
-            "energy_error": energy_change,
-            "energy": float(energy),
-            "accepted": accepted,
-            "model_logp": float(logp),
         }
         return HMCStepData(end, accept_stat, div_info, stats)

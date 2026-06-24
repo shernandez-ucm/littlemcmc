@@ -12,13 +12,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""Sample a 2D Gaussian mixture with all three littlemcmc samplers.
+"""Sample a 2D Gaussian mixture with littlemcmc's samplers.
 
 This exercises, on a single shared target:
 
-* ``HamiltonianMC``           -- the NumPy backend
-* ``HamiltonianMC(backend="jax")`` -- the JIT-compiled JAX backend
-* ``NUTS``                    -- the NumPy No-U-Turn sampler
+* ``HamiltonianMC``                     -- the NumPy HMC step method
+* ``hmc_jax.sample_vmapped_chains``     -- the vmapped multi-chain JAX HMC
+* ``NUTS``                              -- the NumPy No-U-Turn sampler
 
 The target is a balanced mixture of two isotropic 2D Gaussians with means at
 ``(-2, 0)`` and ``(2, 0)``. The barrier between the modes is shallow enough that
@@ -31,12 +31,12 @@ marginal. For every sampler we pool all chains and report:
   (target ``0.5`` / ``0.5``) and the conditional mean of each side (target
   ``-2`` and ``+2``), i.e. both modes are actually populated,
 * the mean acceptance statistic and the number of post-tuning divergences,
-* the wall-clock sampling time (per draw, including tuning and, for the JAX
-  backend, the one-off JIT compilation).
+* the wall-clock sampling time (per draw, including tuning and, for the vmapped
+  JAX sampler, the one-off JIT compilation).
 
-Run with ``python examples/gaussian_mixture_samplers.py``. The JAX backend
-requires ``jax``/``jaxlib`` to be installed; if they are missing the example
-runs the two NumPy samplers and skips the JAX one.
+Run with ``python examples/gaussian_mixture_samplers.py``. The vmapped JAX
+sampler requires ``jax``/``jaxlib`` to be installed; if they are missing the
+example runs the two NumPy samplers and skips the JAX one.
 """
 
 import time
@@ -44,7 +44,6 @@ import time
 import numpy as np
 
 import littlemcmc as lmc
-
 
 # --- Target: balanced mixture of two isotropic 2D Gaussians (identity cov) ----
 WEIGHTS = np.array([0.5, 0.5])
@@ -66,7 +65,7 @@ def numpy_logp_dlogp_func(x):
     """
     x = np.asarray(x, dtype=np.float64)
     diff = x[None, :] - MEANS  # (n_components, ndim)
-    sq = np.sum(diff ** 2, axis=1)  # (n_components,)
+    sq = np.sum(diff**2, axis=1)  # (n_components,)
     # log of each weighted component density (the 2*pi term cancels in the
     # gradient and shifts logp by a constant, but we keep it for honest logp).
     log_comp = np.log(WEIGHTS) - 0.5 * sq - np.log(2 * np.pi)
@@ -94,7 +93,7 @@ def make_jax_logp_dlogp_func():
 
     def logp(x):
         diff = x[None, :] - means
-        sq = jnp.sum(diff ** 2, axis=1)
+        sq = jnp.sum(diff**2, axis=1)
         log_comp = jnp.log(weights) - 0.5 * sq - jnp.log(2 * jnp.pi)
         return jax.scipy.special.logsumexp(log_comp)
 
@@ -117,11 +116,14 @@ def summarize(name, trace, stats, elapsed):
     left_mean = float(x0[x0 < 0].mean()) if np.any(x0 < 0) else float("nan")
     right_mean = float(x0[x0 >= 0].mean()) if np.any(x0 >= 0) else float("nan")
 
-    # HMC reports "accept"; NUTS reports "mean_tree_accept".
+    # HMC reports "accept"; NUTS reports "mean_tree_accept"; the vmapped JAX
+    # sampler reports "acceptance_rate".
     if "accept" in stats:
         accept = float(np.mean(stats["accept"]))
     elif "mean_tree_accept" in stats:
         accept = float(np.mean(stats["mean_tree_accept"]))
+    elif "acceptance_rate" in stats:
+        accept = float(np.mean(stats["acceptance_rate"]))
     else:
         accept = float("nan")
 
@@ -135,7 +137,10 @@ def summarize(name, trace, stats, elapsed):
     print("trace shape          : %s" % (trace.shape,))
     print("marginal mean        : [% .3f, % .3f]   target [ 0, 0]" % (mean[0], mean[1]))
     print("marginal std         : [% .3f, % .3f]   target [ 2.236, 1.0]" % (std[0], std[1]))
-    print("mode coverage (L/R)  : %.2f / %.2f          target 0.50 / 0.50" % (frac_left, 1 - frac_left))
+    print(
+        "mode coverage (L/R)  : %.2f / %.2f          target 0.50 / 0.50"
+        % (frac_left, 1 - frac_left)
+    )
     print("mode means (L/R)     : [% .3f, % .3f]   target [-2, +2]" % (left_mean, right_mean))
     print("mean accept stat     : %.3f" % accept)
     print("divergences          : %d" % n_div)
@@ -166,33 +171,44 @@ def run(name, logp_dlogp_func, step):
     summarize(name, trace, stats, elapsed)
 
 
+def run_vmapped(name, logp_dlogp_func):
+    """Run the vmapped multi-chain JAX HMC and summarize it like ``run``."""
+    from littlemcmc.hmc_jax import sample_vmapped_chains
+
+    start = time.perf_counter()
+    trace, stats = sample_vmapped_chains(
+        logp_dlogp_func,
+        MODEL_NDIM,
+        draws=DRAWS,
+        tune=TUNE,
+        chains=CHAINS,
+        random_seed=SEED,
+    )
+    elapsed = time.perf_counter() - start
+    summarize(name, trace, stats, elapsed)
+
+
 def main():
     np.random.seed(SEED)
 
-    # 1. HMC, NumPy backend.
+    # 1. HMC, NumPy step method.
     run(
-        "HamiltonianMC (numpy backend)",
+        "HamiltonianMC (numpy)",
         numpy_logp_dlogp_func,
         lmc.HamiltonianMC(logp_dlogp_func=numpy_logp_dlogp_func, model_ndim=MODEL_NDIM),
     )
 
-    # 2. HMC, JAX backend (skipped if JAX is unavailable).
+    # 2. Vmapped multi-chain JAX HMC (skipped if JAX is unavailable).
     jax_func = make_jax_logp_dlogp_func()
     if jax_func is None:
         print("=" * 70)
-        print("HamiltonianMC (jax backend): SKIPPED -- jax/jaxlib not installed")
+        print("sample_vmapped_chains (jax): SKIPPED -- jax/jaxlib not installed")
     else:
-        run(
-            "HamiltonianMC (jax backend)",
-            jax_func,
-            lmc.HamiltonianMC(
-                logp_dlogp_func=jax_func, model_ndim=MODEL_NDIM, backend="jax"
-            ),
-        )
+        run_vmapped("sample_vmapped_chains (jax)", jax_func)
 
-    # 3. NUTS, NumPy backend.
+    # 3. NUTS, NumPy step method.
     run(
-        "NUTS (numpy backend)",
+        "NUTS (numpy)",
         numpy_logp_dlogp_func,
         lmc.NUTS(logp_dlogp_func=numpy_logp_dlogp_func, model_ndim=MODEL_NDIM),
     )

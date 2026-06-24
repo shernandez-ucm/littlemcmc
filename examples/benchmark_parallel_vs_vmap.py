@@ -30,15 +30,15 @@ Caveats (this is an honest throughput comparison, not an identical-FLOPs one):
 
 * The NumPy side is the real library path: ``HamiltonianMC`` with step-size and
   mass-matrix adaptation and a *randomized* path length per draw.
-* The JAX side is a compact, hand-written HMC with a *fixed* number of leapfrog
-  steps and a fixed step size -- ``vmap`` requires a uniform leapfrog trip-count
-  across the batch, so a randomized path length cannot be vectorized this way.
-  It uses an identity mass matrix and no adaptation.
+* The JAX side is ``littlemcmc.hmc_jax.sample_vmapped_chains`` -- a vmapped
+  multi-chain HMC with dual-averaging step size and diagonal mass adaptation, but
+  a *fixed* number of leapfrog steps (``vmap`` requires a uniform leapfrog
+  trip-count across the batch, so a randomized path length cannot be vectorized
+  this way). Its reported time includes the one-off JIT compilation.
 
 So the two do slightly different per-draw work; the comparison is
 "valid draws per second of each parallelism strategy", plus a correctness check,
-not a controlled FLOP-for-FLOP race. JAX's one-off compilation time is reported
-separately from steady-state run time.
+not a controlled FLOP-for-FLOP race.
 
 Usage::
 
@@ -92,111 +92,44 @@ def benchmark_numpy(dim, chains, draws, tune, seed):
     }
 
 
-def build_vmapped_hmc(dim, step_size, n_leapfrog, n_total):
-    """Build a JIT-compiled, ``vmap``-over-chains fixed-path-length HMC.
-
-    Returns ``run(q0, key) -> (positions, accept_probs)`` where ``q0`` has shape
-    ``(chains, dim)`` and ``positions`` has shape ``(n_total, chains, dim)``. The
-    whole chain loop runs on-device via ``lax.scan``; chains are the ``vmap``
-    batch axis.
-    """
-    import jax
-    import jax.numpy as jnp
-    from jax import lax
-
-    def logp_grad(q):
-        return -0.5 * jnp.dot(q, q), -q
-
-    def leapfrog(q, p, grad):
-        dt = 0.5 * step_size
-
-        def body(_, carry):
-            q, p, grad = carry
-            p = p + dt * grad
-            q = q + step_size * p  # identity mass matrix: velocity == momentum
-            _, grad = logp_grad(q)
-            p = p + dt * grad
-            return (q, p, grad)
-
-        return lax.fori_loop(0, n_leapfrog, body, (q, p, grad))
-
-    def one_chain_step(q, key):
-        key_p, key_a = jax.random.split(key)
-        logp0, grad0 = logp_grad(q)
-        p0 = jax.random.normal(key_p, (dim,))
-        energy0 = 0.5 * jnp.dot(p0, p0) - logp0
-
-        qn, pn, _ = leapfrog(q, p0, grad0)
-        logpn, _ = logp_grad(qn)
-        energyn = 0.5 * jnp.dot(pn, pn) - logpn
-
-        accept_prob = jnp.minimum(1.0, jnp.exp(energy0 - energyn))
-        accept = jax.random.uniform(key_a) < accept_prob
-        return jnp.where(accept, qn, q), accept_prob
-
-    step_all_chains = jax.vmap(one_chain_step)  # over the leading (chain) axis
-
-    @jax.jit
-    def run(q0, key):
-        def scan_body(carry, _):
-            q, key = carry
-            key, sub = jax.random.split(key)
-            chain_keys = jax.random.split(sub, q.shape[0])
-            q, accept_prob = step_all_chains(q, chain_keys)
-            return (q, key), (q, accept_prob)
-
-        (_, _), (positions, accept_probs) = lax.scan(
-            scan_body, (q0, key), xs=None, length=n_total
-        )
-        return positions, accept_probs
-
-    return run
-
-
-def benchmark_jax(dim, chains, draws, tune, seed, step_size, n_leapfrog):
-    """Time the JAX ``vmap`` HMC over ``chains`` chains (compile vs run split)."""
-    import jax
+def benchmark_jax(dim, chains, draws, tune, seed, n_leapfrog):
+    """Time ``sample_vmapped_chains`` over ``chains`` chains (incl. JIT compile)."""
     import jax.numpy as jnp
 
-    n_total = draws + tune
-    run = build_vmapped_hmc(dim, step_size, n_leapfrog, n_total)
+    from littlemcmc.hmc_jax import sample_vmapped_chains
 
-    key = jax.random.PRNGKey(seed)
-    key, key_init = jax.random.split(key)
-    q0 = jax.random.normal(key_init, (chains, dim))
+    def jax_logp_dlogp_func(x):
+        """Standard-normal log-density and gradient as JAX arrays."""
+        return -0.5 * jnp.dot(x, x), -x
 
-    # First call compiles. Block to exclude JAX's async dispatch from the timing.
-    key, sub = jax.random.split(key)
+    # The returned trace is a NumPy array (a device->host copy), so the timed call
+    # already blocks on completion; no explicit block_until_ready is needed.
     t0 = time.perf_counter()
-    positions, _ = run(q0, sub)
-    positions.block_until_ready()
-    compile_elapsed = time.perf_counter() - t0
+    trace, stats = sample_vmapped_chains(
+        jax_logp_dlogp_func,
+        dim,
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        n_leapfrog=n_leapfrog,
+        random_seed=seed,
+    )
+    elapsed = time.perf_counter() - t0  # includes one-off JIT compilation
 
-    # Steady-state run (already compiled).
-    key, sub = jax.random.split(key)
-    t0 = time.perf_counter()
-    positions, accept_probs = run(q0, sub)
-    positions.block_until_ready()
-    run_elapsed = time.perf_counter() - t0
-
-    samples = np.asarray(positions[tune:]).reshape(-1, dim)  # drop burn-in
+    samples = trace.reshape(-1, dim)
     return {
-        "compile": compile_elapsed,
-        "elapsed": run_elapsed,
-        "draws_per_s": chains * draws / run_elapsed,
+        "elapsed": elapsed,
+        "draws_per_s": chains * draws / elapsed,
         "mean_abs_err": float(np.abs(samples.mean(axis=0)).mean()),
         "std": float(samples.std(axis=0).mean()),
-        "accept": float(np.mean(np.asarray(accept_probs))),
+        "accept": float(np.mean(stats["acceptance_rate"])),
     }
 
 
 def has_jax():
-    try:
-        import jax  # noqa: F401
+    import importlib.util
 
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("jax") is not None
 
 
 def main():
@@ -207,7 +140,6 @@ def main():
     )
     parser.add_argument("--draws", type=int, default=1000)
     parser.add_argument("--tune", type=int, default=500)
-    parser.add_argument("--step-size", type=float, default=0.2, help="JAX HMC step size")
     parser.add_argument("--leapfrog", type=int, default=10, help="JAX HMC leapfrog steps")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -216,35 +148,32 @@ def main():
     jax_available = has_jax()
 
     print(
-        "Target: %d-D standard normal | draws=%d tune=%d | JAX step=%g, L=%d"
-        % (args.dim, args.draws, args.tune, args.step_size, args.leapfrog)
+        "Target: %d-D standard normal | draws=%d tune=%d | JAX L=%d"
+        % (args.dim, args.draws, args.tune, args.leapfrog)
     )
     print(
-        "%-7s | %-26s | %-34s | %-8s"
+        "%-7s | %-26s | %-26s | %-8s"
         % ("chains", "numpy (process-parallel)", "jax (vmap-parallel)", "speedup")
     )
     print(
-        "%-7s | %-9s %-7s %-7s | %-9s %-8s %-7s %-6s | %-8s"
-        % ("", "time(s)", "draw/s", "std", "run(s)", "cmpl(s)", "draw/s", "std", "draw/s")
+        "%-7s | %-9s %-7s %-7s | %-9s %-7s %-7s | %-8s"
+        % ("", "time(s)", "draw/s", "std", "time(s)", "draw/s", "std", "draw/s")
     )
-    print("-" * 92)
+    print("-" * 84)
 
     for chains in chain_counts:
         npr = benchmark_numpy(args.dim, chains, args.draws, args.tune, args.seed)
         if jax_available:
-            jxr = benchmark_jax(
-                args.dim, chains, args.draws, args.tune, args.seed, args.step_size, args.leapfrog
-            )
+            jxr = benchmark_jax(args.dim, chains, args.draws, args.tune, args.seed, args.leapfrog)
             speedup = jxr["draws_per_s"] / npr["draws_per_s"]
             print(
-                "%-7d | %-9.3f %-7.0f %-7.3f | %-9.4f %-8.3f %-7.0f %-6.3f | %-6.1fx"
+                "%-7d | %-9.3f %-7.0f %-7.3f | %-9.3f %-7.0f %-7.3f | %-6.1fx"
                 % (
                     chains,
                     npr["elapsed"],
                     npr["draws_per_s"],
                     npr["std"],
                     jxr["elapsed"],
-                    jxr["compile"],
                     jxr["draws_per_s"],
                     jxr["std"],
                     speedup,
@@ -252,14 +181,14 @@ def main():
             )
         else:
             print(
-                "%-7d | %-9.3f %-7.0f %-7.3f | %-34s | %-8s"
+                "%-7d | %-9.3f %-7.0f %-7.3f | %-26s | %-8s"
                 % (chains, npr["elapsed"], npr["draws_per_s"], npr["std"], "skipped (no jax)", "-")
             )
 
-    print("-" * 92)
+    print("-" * 84)
     print("std should be ~1.0 for both (recovering the standard normal).")
     if jax_available:
-        print("jax 'cmpl(s)' is one-off compilation; 'run(s)' is steady-state for `draws+tune`.")
+        print("jax 'time(s)' includes one-off JIT compilation and the warmup/tuning phase.")
 
 
 if __name__ == "__main__":

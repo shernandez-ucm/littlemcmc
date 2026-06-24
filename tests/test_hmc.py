@@ -80,39 +80,34 @@ def test_nuts_tuning():
     # assert np.all(trace['step_size'][5:] == trace['step_size'][5])
 
 
-def test_hmc_jax_backend_validation():
-    with pytest.raises(ValueError):
-        HamiltonianMC(logp_dlogp_func=logp_dlogp_func, model_ndim=1, backend="cupy")
-
-
-def test_hmc_jax_backend_samples():
+def test_sample_vmapped_chains():
     jax = pytest.importorskip("jax")
     jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
 
+    from littlemcmc.hmc_jax import sample_vmapped_chains
+
     def jax_logp_dlogp_func(x):
         # Standard normal: logp = -0.5 * sum(x ** 2), grad = -x.
-        return -0.5 * jnp.sum(x ** 2), -x
+        return -0.5 * jnp.sum(x**2), -x
 
     model_ndim = 2
     draws = 500
     tune = 500
-    step = lmc.HamiltonianMC(
-        logp_dlogp_func=jax_logp_dlogp_func, model_ndim=model_ndim, backend="jax"
-    )
-    trace, stats = lmc.sample(
-        logp_dlogp_func=jax_logp_dlogp_func,
-        model_ndim=model_ndim,
+    chains = 2
+    trace, stats = sample_vmapped_chains(
+        jax_logp_dlogp_func,
+        model_ndim,
         draws=draws,
         tune=tune,
-        step=step,
-        chains=1,
-        cores=1,
-        progressbar=False,
+        chains=chains,
+        random_seed=42,
     )
 
-    assert trace.shape == (1, draws, model_ndim)
+    assert trace.shape == (chains, draws, model_ndim)
     assert np.all(np.isfinite(trace))
+    assert stats["acceptance_rate"].shape == (chains, draws)
+    assert stats["diverging"].shape == (chains, draws)
     # Recovered posterior should be roughly standard normal.
     npt.assert_allclose(trace.mean(axis=(0, 1)), np.zeros(model_ndim), atol=0.2)
     npt.assert_allclose(trace.std(axis=(0, 1)), np.ones(model_ndim), atol=0.3)

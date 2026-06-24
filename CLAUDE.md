@@ -54,16 +54,14 @@ fixes from upstream PyMC3, expect a near-1:1 file correspondence.
   the public `(trace, stats)` arrays. **Unrelated to PyMC3's `sampling.py`** despite the name.
 - `base_hmc.py` — `BaseHMC`, the shared base class. Holds the integrator, the quadpotential (mass
   matrix), and step-size adaptation; defines the `_hamiltonian_step` hook that subclasses implement.
-- `hmc.py` — `HamiltonianMC`, fixed-path-length HMC (`_hamiltonian_step`). Constructed with
-  `backend="numpy"` (default) or `backend="jax"`; the latter dispatches the trajectory to
-  `hmc_jax.py`.
-- `hmc_jax.py` — optional JIT-compiled HMC trajectory. `build_trajectory()` fuses the leapfrog loop
-  (`lax.fori_loop`) and Metropolis accept/reject into one `jax.jit` function. Requires a
-  JAX-traceable `logp_dlogp_func` (returns JAX arrays, *not* `np.asarray`) and a diagonal mass
-  matrix. JAX is a lazy/optional import — only `backend="jax"` pulls it in, so the rest of the
-  package (and NUTS) stay numpy-only. Randomness (path length, accept threshold) is drawn with
-  `np.random` *outside* the compiled region, so the trajectory stays a pure function and existing
-  seeding is preserved.
+- `hmc.py` — `HamiltonianMC`, numpy fixed-path-length HMC (`_hamiltonian_step`).
+- `hmc_jax.py` — optional vmapped multi-chain HMC. `sample_vmapped_chains()` runs all chains as the
+  `jax.vmap` batch axis inside one `jax.jit` program (`lax.scan` over draws, `lax.fori_loop` over
+  leapfrog steps), with dual-averaging step size and diagonal mass adaptation in a warmup phase.
+  Requires a JAX-traceable `logp_dlogp_func` (returns JAX arrays, *not* `np.asarray`) and a diagonal
+  mass matrix. JAX is a lazy/optional import — nothing in the package imports `hmc_jax` at module
+  load (examples import it directly), so the rest of the package (and NUTS) stay numpy-only. This is
+  an alternative to `sample`'s process-per-chain parallelism, not a `HamiltonianMC` backend.
 - `nuts.py` — `NUTS`, the default step method. `_Tree` implements the recursive trajectory doubling
   and U-turn termination.
 - `integration.py` — `CpuLeapfrogIntegrator`, the leapfrog symplectic integrator. Raises
