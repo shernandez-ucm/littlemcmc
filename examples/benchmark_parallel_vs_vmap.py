@@ -49,7 +49,14 @@ The JAX rows are skipped if ``jax``/``jaxlib`` are not installed.
 """
 
 import argparse
+import multiprocessing as mp
 import time
+
+# Use "spawn" globally: this script initializes JAX (which is multithreaded) and also
+# spawns worker processes for the NumPy parallel path. A fork() with live JAX threads
+# can deadlock (Python 3.12 warns about exactly this), so start fresh interpreters
+# instead. Must run before importing JAX or littlemcmc.
+mp.set_start_method("spawn", force=True)
 
 import numpy as np
 
