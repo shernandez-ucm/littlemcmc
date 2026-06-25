@@ -30,13 +30,18 @@ Caveats (this is an honest throughput comparison, not an identical-FLOPs one):
 
 * The NumPy side is the real library path: ``HamiltonianMC`` with step-size and
   mass-matrix adaptation and a *randomized* path length per draw.
-* The JAX side is ``littlemcmc.hmc_jax.sample_vmapped_chains`` -- a vmapped
+* The JAX HMC side is ``littlemcmc.hmc_jax.sample_vmapped_chains`` -- a vmapped
   multi-chain HMC with dual-averaging step size and diagonal mass adaptation, but
   a *fixed* number of leapfrog steps (``vmap`` requires a uniform leapfrog
   trip-count across the batch, so a randomized path length cannot be vectorized
   this way). Its reported time includes the one-off JIT compilation.
+* The JAX NUTS side is ``littlemcmc.nuts_jax.sample_vmapped_nuts_chains`` -- the
+  same vmapped multi-chain machinery but with the adaptive No-U-Turn path length
+  (recursive tree doubling, capped at ``max_treedepth``) instead of a fixed
+  leapfrog count, so its per-draw work varies with the trajectory. Its reported
+  time also includes the one-off JIT compilation.
 
-So the two do slightly different per-draw work; the comparison is
+So the samplers do slightly different per-draw work; the comparison is
 "valid draws per second of each parallelism strategy", plus a correctness check,
 not a controlled FLOP-for-FLOP race.
 
@@ -133,6 +138,40 @@ def benchmark_jax(dim, chains, draws, tune, seed, n_leapfrog):
     }
 
 
+def benchmark_jax_nuts(dim, chains, draws, tune, seed, max_treedepth):
+    """Time ``sample_vmapped_nuts_chains`` over ``chains`` chains (incl. JIT compile)."""
+    import jax.numpy as jnp
+
+    from littlemcmc.nuts_jax import sample_vmapped_nuts_chains
+
+    def jax_logp_dlogp_func(x):
+        """Standard-normal log-density and gradient as JAX arrays."""
+        return -0.5 * jnp.dot(x, x), -x
+
+    # The returned trace is a NumPy array (a device->host copy), so the timed call
+    # already blocks on completion; no explicit block_until_ready is needed.
+    t0 = time.perf_counter()
+    trace, stats = sample_vmapped_nuts_chains(
+        jax_logp_dlogp_func,
+        dim,
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        max_treedepth=max_treedepth,
+        random_seed=seed,
+    )
+    elapsed = time.perf_counter() - t0  # includes one-off JIT compilation
+
+    samples = trace.reshape(-1, dim)
+    return {
+        "elapsed": elapsed,
+        "draws_per_s": chains * draws / elapsed,
+        "mean_abs_err": float(np.abs(samples.mean(axis=0)).mean()),
+        "std": float(samples.std(axis=0).mean()),
+        "accept": float(np.mean(stats["acceptance_rate"])),
+    }
+
+
 def has_jax():
     import importlib.util
 
@@ -148,6 +187,9 @@ def main():
     parser.add_argument("--draws", type=int, default=1000)
     parser.add_argument("--tune", type=int, default=500)
     parser.add_argument("--leapfrog", type=int, default=10, help="JAX HMC leapfrog steps")
+    parser.add_argument(
+        "--max-treedepth", type=int, default=10, help="JAX NUTS max tree depth"
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -155,26 +197,33 @@ def main():
     jax_available = has_jax()
 
     print(
-        "Target: %d-D standard normal | draws=%d tune=%d | JAX L=%d"
-        % (args.dim, args.draws, args.tune, args.leapfrog)
+        "Target: %d-D standard normal | draws=%d tune=%d | JAX L=%d max_treedepth=%d"
+        % (args.dim, args.draws, args.tune, args.leapfrog, args.max_treedepth)
     )
     print(
-        "%-7s | %-26s | %-26s | %-8s"
-        % ("chains", "numpy (process-parallel)", "jax (vmap-parallel)", "speedup")
+        "%-7s | %-26s | %-26s | %-26s"
+        % (
+            "chains",
+            "numpy (process-parallel)",
+            "jax-hmc (vmap-parallel)",
+            "jax-nuts (vmap-parallel)",
+        )
     )
     print(
-        "%-7s | %-9s %-7s %-7s | %-9s %-7s %-7s | %-8s"
-        % ("", "time(s)", "draw/s", "std", "time(s)", "draw/s", "std", "draw/s")
+        "%-7s | %-9s %-7s %-7s | %-9s %-7s %-7s | %-9s %-7s %-7s"
+        % ("", "time(s)", "draw/s", "std", "time(s)", "draw/s", "std", "time(s)", "draw/s", "std")
     )
-    print("-" * 84)
+    print("-" * 96)
 
     for chains in chain_counts:
         npr = benchmark_numpy(args.dim, chains, args.draws, args.tune, args.seed)
         if jax_available:
             jxr = benchmark_jax(args.dim, chains, args.draws, args.tune, args.seed, args.leapfrog)
-            speedup = jxr["draws_per_s"] / npr["draws_per_s"]
+            jnr = benchmark_jax_nuts(
+                args.dim, chains, args.draws, args.tune, args.seed, args.max_treedepth
+            )
             print(
-                "%-7d | %-9.3f %-7.0f %-7.3f | %-9.3f %-7.0f %-7.3f | %-6.1fx"
+                "%-7d | %-9.3f %-7.0f %-7.3f | %-9.3f %-7.0f %-7.3f | %-9.3f %-7.0f %-7.3f"
                 % (
                     chains,
                     npr["elapsed"],
@@ -183,17 +232,26 @@ def main():
                     jxr["elapsed"],
                     jxr["draws_per_s"],
                     jxr["std"],
-                    speedup,
+                    jnr["elapsed"],
+                    jnr["draws_per_s"],
+                    jnr["std"],
                 )
             )
         else:
             print(
-                "%-7d | %-9.3f %-7.0f %-7.3f | %-26s | %-8s"
-                % (chains, npr["elapsed"], npr["draws_per_s"], npr["std"], "skipped (no jax)", "-")
+                "%-7d | %-9.3f %-7.0f %-7.3f | %-26s | %-26s"
+                % (
+                    chains,
+                    npr["elapsed"],
+                    npr["draws_per_s"],
+                    npr["std"],
+                    "skipped (no jax)",
+                    "skipped (no jax)",
+                )
             )
 
-    print("-" * 84)
-    print("std should be ~1.0 for both (recovering the standard normal).")
+    print("-" * 96)
+    print("std should be ~1.0 for all (recovering the standard normal).")
     if jax_available:
         print("jax 'time(s)' includes one-off JIT compilation and the warmup/tuning phase.")
 

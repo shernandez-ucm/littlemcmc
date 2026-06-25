@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import pymc as pm
 from littlemcmc.hmc_jax import sample_vmapped_chains
+from littlemcmc.nuts_jax import sample_vmapped_nuts_chains
 
 # x64 is left off (jax default float32) to keep the GPU trajectory fast; the data is
 # cast to match so distrax doesn't emit float64->float32 truncation warnings.
@@ -40,6 +41,7 @@ N_CHAINS = 4
 N_WARMUP = 1000
 N_DRAWS = 1000
 N_LEAPFROG = 16
+MAX_TREEDEPTH = 10
 TARGET_ACCEPT = 0.9
 EMAX = 1000.0
 SEED = 42
@@ -114,6 +116,45 @@ def test_hmc_jax():
     idata = az.from_dict({"posterior": posterior, "sample_stats": sample_stats})
     return idata, stats, sample_stats
 
+def test_nuts_jax():
+    # Same pytree start as the HMC backend; NUTS adapts the path length itself, so
+    # there is no n_leapfrog -- max_treedepth caps the trajectory instead.
+    k_eta, k_mu, k_tau = jax.random.split(jax.random.PRNGKey(SEED), 3)
+    start = {
+        "eta": jax.random.normal(k_eta, (N_CHAINS, J)),
+        "mu": jax.random.normal(k_mu, (N_CHAINS,)),
+        "log_tau": jax.random.normal(k_tau, (N_CHAINS,)),
+    }
+
+    trace, stats = sample_vmapped_nuts_chains(
+        logp_dlogp_func,
+        None,
+        draws=N_DRAWS,
+        tune=N_WARMUP,
+        chains=N_CHAINS,
+        max_treedepth=MAX_TREEDEPTH,
+        target_accept=TARGET_ACCEPT,
+        init_step=INIT_STEP,
+        Emax=EMAX,
+        random_seed=SEED,
+        start=start,
+    )
+
+    # trace is a pytree of (chains, draws, *event) arrays matching the position.
+    log_tau = trace["log_tau"]
+    posterior = {
+        "eta": trace["eta"],
+        "mu": trace["mu"],
+        "log_tau": log_tau,
+        "tau": np.exp(log_tau),
+    }
+    sample_stats = {
+        "acceptance_rate": stats["acceptance_rate"],
+        "diverging": stats["diverging"],
+    }
+    idata = az.from_dict({"posterior": posterior, "sample_stats": sample_stats})
+    return idata, stats, sample_stats
+
 def test_pymc():
     with pm.Model() as model:
         mu = pm.Normal('mu', 0., 10.)
@@ -132,10 +173,18 @@ def test_pymc():
 
 def main():
     idata, stats, sample_stats = test_hmc_jax()
+    print("vmapped HMC summary:")
     print(az.summary(idata, var_names=["mu", "tau", "eta"]))
     print("\nFinal step size:", stats["step_size"])
     print("Mean acceptance:", float(np.mean(sample_stats["acceptance_rate"])))
     print("Divergences:", int(sample_stats["diverging"].sum()))
+    print("-------------\n")
+    idata_nuts, stats_nuts, sample_stats_nuts = test_nuts_jax()
+    print("vmapped NUTS summary:")
+    print(az.summary(idata_nuts, var_names=["mu", "tau", "eta"]))
+    print("\nNUTS final step size:", stats_nuts["step_size"])
+    print("NUTS mean acceptance:", float(np.mean(sample_stats_nuts["acceptance_rate"])))
+    print("NUTS divergences:", int(sample_stats_nuts["diverging"].sum()))
     print("-------------\n")
     ## The following is a PyMC3 model that is equivalent to the above, for comparison.
     idata_pm = test_pymc()

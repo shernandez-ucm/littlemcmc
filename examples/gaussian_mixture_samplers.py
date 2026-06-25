@@ -16,9 +16,10 @@
 
 This exercises, on a single shared target:
 
-* ``HamiltonianMC``                     -- the NumPy HMC step method
-* ``hmc_jax.sample_vmapped_chains``     -- the vmapped multi-chain JAX HMC
-* ``NUTS``                              -- the NumPy No-U-Turn sampler
+* ``HamiltonianMC``                       -- the NumPy HMC step method
+* ``hmc_jax.sample_vmapped_chains``       -- the vmapped multi-chain JAX HMC
+* ``NUTS``                                -- the NumPy No-U-Turn sampler
+* ``nuts_jax.sample_vmapped_nuts_chains`` -- the vmapped multi-chain JAX NUTS
 
 The target is a balanced mixture of two isotropic 2D Gaussians with means at
 ``(-2, 0)`` and ``(2, 0)``. The barrier between the modes is shallow enough that
@@ -171,12 +172,15 @@ def run(name, logp_dlogp_func, step):
     summarize(name, trace, stats, elapsed)
 
 
-def run_vmapped(name, logp_dlogp_func):
-    """Run the vmapped multi-chain JAX HMC and summarize it like ``run``."""
-    from littlemcmc.hmc_jax import sample_vmapped_chains
+def run_vmapped(name, logp_dlogp_func, sampler):
+    """Run a vmapped multi-chain JAX sampler and summarize it like ``run``.
 
+    ``sampler`` is ``hmc_jax.sample_vmapped_chains`` or
+    ``nuts_jax.sample_vmapped_nuts_chains``; both share the same
+    ``(logp_dlogp_func, model_ndim, ...) -> (trace, stats)`` contract.
+    """
     start = time.perf_counter()
-    trace, stats = sample_vmapped_chains(
+    trace, stats = sampler(
         logp_dlogp_func,
         MODEL_NDIM,
         draws=DRAWS,
@@ -204,7 +208,9 @@ def main():
         print("=" * 70)
         print("sample_vmapped_chains (jax): SKIPPED -- jax/jaxlib not installed")
     else:
-        run_vmapped("sample_vmapped_chains (jax)", jax_func)
+        from littlemcmc.hmc_jax import sample_vmapped_chains
+
+        run_vmapped("sample_vmapped_chains (jax)", jax_func, sample_vmapped_chains)
 
     # 3. NUTS, NumPy step method.
     run(
@@ -212,6 +218,17 @@ def main():
         numpy_logp_dlogp_func,
         lmc.NUTS(logp_dlogp_func=numpy_logp_dlogp_func, model_ndim=MODEL_NDIM),
     )
+
+    # 4. Vmapped multi-chain JAX NUTS (skipped if JAX is unavailable).
+    if jax_func is None:
+        print("=" * 70)
+        print("sample_vmapped_nuts_chains (jax): SKIPPED -- jax/jaxlib not installed")
+    else:
+        from littlemcmc.nuts_jax import sample_vmapped_nuts_chains
+
+        run_vmapped(
+            "sample_vmapped_nuts_chains (jax)", jax_func, sample_vmapped_nuts_chains
+        )
 
 
 if __name__ == "__main__":
