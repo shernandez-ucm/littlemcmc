@@ -18,7 +18,7 @@ warmup variance) so the well-known funnel-ish ``mu``/``tau`` geometry still mixe
 import os
 
 # Run the vmapped trajectory on the GPU.
-os.environ.setdefault("JAX_PLATFORMS", "cuda")
+#os.environ.setdefault("JAX_PLATFORMS", "cuda")
 
 import arviz as az
 import distrax
@@ -26,7 +26,7 @@ import jax
 from jax import value_and_grad
 import jax.numpy as jnp
 import numpy as np
-
+import pymc as pm
 from littlemcmc.hmc_jax import sample_vmapped_chains
 
 # x64 is left off (jax default float32) to keep the GPU trajectory fast; the data is
@@ -75,8 +75,7 @@ def logp(q):
 # JAX arrays (no np.asarray) built purely from jax.numpy ops.
 logp_dlogp_func = value_and_grad(logp)
 
-
-def main():
+def test_hmc_jax():
     # Per-chain standard-normal starting points, one leaf per parameter. The pytree
     # structure here defines what the sampler advances; model_ndim is unused for pytrees.
     k_eta, k_mu, k_tau = jax.random.split(jax.random.PRNGKey(SEED), 3)
@@ -112,14 +111,41 @@ def main():
         "acceptance_rate": stats["acceptance_rate"],
         "diverging": stats["diverging"],
     }
-
     idata = az.from_dict({"posterior": posterior, "sample_stats": sample_stats})
+    return idata, stats, sample_stats
 
+def test_pymc():
+    with pm.Model() as model:
+        mu = pm.Normal('mu', 0., 10.)
+        tau = pm.LogNormal('tau', 0., 1.)
+        eta = pm.Normal('eta', shape=8)
+        obs = pm.Normal('observed', mu + tau * eta, sigma, observed=y)
+        idata = pm.sample(
+            draws=N_DRAWS,
+            tune=N_WARMUP,
+            chains=N_CHAINS,
+            cores=1,
+            target_accept=TARGET_ACCEPT,
+            random_seed=SEED,
+            return_inferencedata=True)
+    return idata
+
+def main():
+    idata, stats, sample_stats = test_hmc_jax()
     print(az.summary(idata, var_names=["mu", "tau", "eta"]))
     print("\nFinal step size:", stats["step_size"])
     print("Mean acceptance:", float(np.mean(sample_stats["acceptance_rate"])))
     print("Divergences:", int(sample_stats["diverging"].sum()))
-    return idata
+    print("-------------\n")
+    ## The following is a PyMC3 model that is equivalent to the above, for comparison.
+    idata_pm = test_pymc()
+    print("\nPyMC3 summary:")
+    print(az.summary(idata_pm, var_names=["mu", "tau", "eta"]))
+    print("\nPyMC3 final step size:", idata_pm.sample_stats.step_size.values[:,-1])
+    print("PyMC3 mean acceptance:", float(np.mean(idata_pm.sample_stats.acceptance_rate.values)))
+    print("\nPyMC3 divergences:", int(idata_pm.sample_stats.diverging.sum()))
+
+    return
 
 
 if __name__ == "__main__":
