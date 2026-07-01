@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from jax import jit, vmap, value_and_grad
 from jax.tree_util import tree_map
 from jax.flatten_util import ravel_pytree
+import flax.linen as nn
 
 import distrax
 # distrax no trae una t-Student nativa, así que envolvemos la de TFP sobre el
@@ -60,25 +61,60 @@ def standardize_X(a):
 
 
 # ---------------------------------------------------------------------------
-# MLP funcional (lista de pares (W, b)); compatible con el bucle SGD de abajo.
+# MLP (flax.linen): cuerpo (capas ocultas ReLU) y cabeza (capa lineal final)
+# como submódulos con nombre ('body'/'head'), para poder congelar el cuerpo y
+# muestrear solo la cabeza en el esquema bayesiano de última capa más abajo.
 # ---------------------------------------------------------------------------
-def init_mlp(key, sizes):
-    '''Inicializa los parámetros de un MLP con inicialización tipo He.'''
-    params = []
-    keys = jax.random.split(key, len(sizes) - 1)
-    for k, din, dout in zip(keys, sizes[:-1], sizes[1:]):
-        W = jax.random.normal(k, (din, dout)) * jnp.sqrt(2.0 / din)
-        b = jnp.zeros((dout,))
-        params.append((W, b))
-    return params
+HIDDEN_SIZES = (64, 64)
+OUT_SIZE = 3
+
+
+class MLPBody(nn.Module):
+    '''Capas ocultas ReLU; produce las características phi(x).'''
+    hidden_sizes: tuple
+
+    @nn.compact
+    def __call__(self, x):
+        for h in self.hidden_sizes:
+            x = nn.relu(nn.Dense(h, kernel_init=jax.nn.initializers.he_normal())(x))
+        return x
+
+
+class MLPHead(nn.Module):
+    '''Capa lineal final: phi(x) -> (mu, log(sigma^2), nu_raw).'''
+    out_size: int
+
+    @nn.compact
+    def __call__(self, phi):
+        return nn.Dense(self.out_size, kernel_init=jax.nn.initializers.he_normal())(phi)
+
+
+class MLP(nn.Module):
+    '''MLP completo = MLPBody + MLPHead, con submódulos nombrados 'body'/'head'.'''
+    hidden_sizes: tuple
+    out_size: int
+
+    def setup(self):
+        self.body = MLPBody(self.hidden_sizes)
+        self.head = MLPHead(self.out_size)
+
+    def __call__(self, x):
+        return self.head(self.body(x))
+
+
+mlp = MLP(hidden_sizes=HIDDEN_SIZES, out_size=OUT_SIZE)
+mlp_body = MLPBody(hidden_sizes=HIDDEN_SIZES)
+mlp_head = MLPHead(out_size=OUT_SIZE)
+
+
+def init_mlp(key, in_dim=1):
+    '''Inicializa los parámetros de `mlp` (dict anidado {'body': ..., 'head': ...}).'''
+    return mlp.init(key, jnp.zeros((1, in_dim)))["params"]
 
 
 def mlp_forward(params, x):
-    '''Pasada hacia adelante: capas ReLU ocultas y salida lineal.'''
-    for W, b in params[:-1]:
-        x = jax.nn.relu(x @ W + b)
-    W, b = params[-1]
-    return x @ W + b
+    '''Pasada hacia adelante del MLP completo (flax `nn.Module.apply`).'''
+    return mlp.apply({"params": params}, x)
 
 
 def init_sgd(params):
@@ -138,19 +174,17 @@ def predict_params(params, x):
 
 
 def mlp_features(body_params, x):
-    '''Extractor de características: todas las capas menos la última, con ReLU.
+    '''Extractor de características: `MLPBody` (todas las capas menos la última).
 
     Devuelve phi(x), las activaciones que alimentan la capa lineal final. En el
     esquema bayesiano de última capa, este cuerpo queda congelado en su valor MAP.
     '''
-    for W, b in body_params:
-        x = jax.nn.relu(x @ W + b)
-    return x
+    return mlp_body.apply({"params": body_params}, x)
 
 
-def predict_params_last(W_last, b_last, phi):
-    '''(mu, sigma, nu) a partir de la última capa lineal sobre características phi.'''
-    out = phi @ W_last + b_last
+def predict_params_last(head_params, phi):
+    '''(mu, sigma, nu) a partir de `MLPHead` (capa lineal final) sobre características phi.'''
+    out = mlp_head.apply({"params": head_params}, phi)
     mu = out[:, 0]
     sigma = jnp.exp(0.5 * jnp.clip(out[:, 1], -7.0, 7.0))
     nu = 2.0 + jax.nn.softplus(out[:, 2])
@@ -254,7 +288,7 @@ Xgrid = jnp.asarray(standardize_X(xx), dtype=jnp.float32)
 # ---------------------------------------------------------------------------
 random_key = jax.random.PRNGKey(RANDOM_STATE)
 params_tstudent_key, random_key = jax.random.split(random_key)
-params_tstudent = init_mlp(params_tstudent_key, [1, 64, 64, 3])
+params_tstudent = init_mlp(params_tstudent_key)
 print("Entrenando MLP con pérdida t-student...")
 params_tstudent, hist_tstudent = train(
     tstudent_loss, params_tstudent, Xtr, ytr, n_epochs=20000, lr=1e-2
@@ -294,7 +328,7 @@ print("Gráfica guardada en bayesian_neural_net_horseshoe.png")
 # de dimensión 2 * model_ndim + 1 (el doble de parámetros que la previa gaussiana).
 # ---------------------------------------------------------------------------
 key_b, random_key = jax.random.split(random_key)
-params_small = init_mlp(key_b, [1, 64, 64, 3])
+params_small = init_mlp(key_b)
 print("\nEntrenando MLP pequeño (SGD) para inicializar NUTS...")
 params_small, _ = train(tstudent_loss, params_small, Xtr, ytr, n_epochs=8000, lr=1e-2)
 
@@ -404,8 +438,8 @@ print_shrinkage("HMC ", theta_samples_hmc, model_ndim)
 #         sum_i log t(y_i | head(phi(x_i); W_L, b_L)) + previa horseshoe
 #     con phi(x) = cuerpo MAP congelado, w_L = z_L * lambda_L * tau_L.
 # ---------------------------------------------------------------------------
-body_params = params_small[:-1]          # capas congeladas (valor MAP)
-last_params = params_small[-1]           # (W_L, b_L): lo único que se muestrea
+body_params = params_small["body"]       # capas congeladas (valor MAP)
+last_params = params_small["head"]       # cabeza (MLPHead): lo único que se muestrea
 flat0_last, unflatten_last = ravel_pytree(last_params)
 model_ndim_last = int(flat0_last.size)
 theta_ndim_last = 2 * model_ndim_last + 1
@@ -418,8 +452,8 @@ phi_tr = jax.lax.stop_gradient(mlp_features(body_params, Xtr))
 def log_posterior_last(theta):
     '''log-posterior no normalizado sobre la última capa (cuerpo congelado), previa horseshoe.'''
     flat = horseshoe_weights(theta, model_ndim_last)
-    W_last, b_last = unflatten_last(flat)
-    mu, sigma, nu = predict_params_last(W_last, b_last, phi_tr)
+    head_params = unflatten_last(flat)
+    mu, sigma, nu = predict_params_last(head_params, phi_tr)
     loglik = jnp.sum(tstudent_logpdf(ytr, mu, sigma, nu))
     return loglik + horseshoe_logprior(theta, model_ndim_last)
 
@@ -465,8 +499,8 @@ hmc_mean_grid = np.asarray(jnp.mean(post_mu_grid_hmc, axis=0))
 
 
 def grid_mu_last(flat):
-    W_last, b_last = unflatten_last(flat)
-    mu, _, _ = predict_params_last(W_last, b_last, phi_grid)
+    head_params = unflatten_last(flat)
+    mu, _, _ = predict_params_last(head_params, phi_grid)
     return mu
 
 
@@ -554,8 +588,8 @@ def test_pred(flat):
 
 
 def test_pred_last(flat):
-    W_last, b_last = unflatten_last(flat)
-    mu, sigma, nu = predict_params_last(W_last, b_last, phi_te)
+    head_params = unflatten_last(flat)
+    mu, sigma, nu = predict_params_last(head_params, phi_te)
     return mu, tstudent_logpdf(yte, mu, sigma, nu)
 
 
@@ -564,8 +598,8 @@ def lastlayer_pred_samples(post_samples, key):
     keys = jax.random.split(key, post_samples.shape[0])
 
     def one(flat, k):
-        W_last, b_last = unflatten_last(flat)
-        mu, sigma, nu = predict_params_last(W_last, b_last, phi_te)
+        head_params = unflatten_last(flat)
+        mu, sigma, nu = predict_params_last(head_params, phi_te)
         return tstudent_rvs(k, mu, sigma, nu)
 
     ys = vmap(one)(post_samples, keys)                                       # (S, N_test)
