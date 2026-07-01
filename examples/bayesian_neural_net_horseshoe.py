@@ -20,6 +20,24 @@ tfd = tfp.distributions
 from littlemcmc.nuts_jax import sample_vmapped_nuts_chains
 from littlemcmc.hmc_jax import sample_vmapped_chains
 
+# ---------------------------------------------------------------------------
+# Variante con previa horseshoe (Carvalho, Polson & Scott) sobre los pesos.
+#
+# `bayesian_neural_net.py` usa una previa N(0, 1) débilmente informativa e
+# idéntica para todos los pesos. Aquí la reemplazamos por la previa horseshoe
+# global-local jerárquica tal como la formula Kohns & Szendrei, "Horseshoe
+# prior Bayesian quantile regression" (J. R. Stat. Soc. C, 2024,
+# https://academic.oup.com/jrsssc/article/73/1/193/7336940), ec. de la previa:
+#     beta_j | lambda_j^2, nu^2 ~ N(0, lambda_j^2 * nu^2)
+#     lambda_j ~ C+(0, 1)   (escala LOCAL, una por peso -> permite pesos != 0)
+#     nu       ~ C+(0, 1)   (escala GLOBAL, una sola -> encoge la red entera)
+# Las colas pesadas de la Half-Cauchy en lambda_j dejan "escapar" del encogimiento
+# global a los pesos realmente relevantes, mientras que nu empuja al resto hacia
+# cero: es la previa canónica para regularización/selección de variables
+# bayesiana, aplicada aquí a los pesos de una NN pequeña en vez de a
+# coeficientes de una regresión.
+# ---------------------------------------------------------------------------
+
 RANDOM_STATE = 42   # semilla única para todo el laboratorio (reproducibilidad)
 
 
@@ -156,6 +174,51 @@ def tstudent_rvs(key, mu, sigma, nu, sample_shape=()):
 
 
 # ---------------------------------------------------------------------------
+# Previa horseshoe (no centrada): theta = [z, eta_lambda, eta_tau] ->
+# w = z * exp(eta_lambda) * exp(eta_tau). El muestreador nunca ve lambda/tau
+# directamente (siempre positivos): sample en el logaritmo evita la geometría
+# de "embudo" que rompería a HMC/NUTS si se intentara centrar la previa.
+# ---------------------------------------------------------------------------
+def log_half_cauchy(eta):
+    '''log p(eta) cuando lambda = exp(eta) ~ Half-Cauchy(0, 1).
+
+    p(lambda) = 2 / (pi * (1 + lambda^2)); con el jacobiano de eta = log(lambda)
+    (d lambda/d eta = lambda) los términos en lambda se cancelan y queda
+    log p(eta) = log(2/pi) + eta - softplus(2 eta), estable en ambas colas.
+    '''
+    return jnp.log(2.0 / jnp.pi) + eta - jax.nn.softplus(2.0 * eta)
+
+
+def unpack_horseshoe(theta, n_weights):
+    '''Separa el vector plano muestreado en (z, eta_lambda, eta_tau).'''
+    z = theta[:n_weights]
+    eta_lambda = theta[n_weights:2 * n_weights]
+    eta_tau = theta[2 * n_weights]
+    return z, eta_lambda, eta_tau
+
+
+def horseshoe_weights(theta, n_weights):
+    '''Pesos w = z * lambda * tau (parametrización no centrada del horseshoe).'''
+    z, eta_lambda, eta_tau = unpack_horseshoe(theta, n_weights)
+    return z * jnp.exp(eta_lambda) * jnp.exp(eta_tau)
+
+
+def horseshoe_logprior(theta, n_weights):
+    '''log p(z, lambda, tau): N(0,1) en z y Half-Cauchy(0,1) en cada lambda_j y en tau.'''
+    z, eta_lambda, eta_tau = unpack_horseshoe(theta, n_weights)
+    logp_z = -0.5 * jnp.sum(z ** 2)
+    logp_lambda = jnp.sum(log_half_cauchy(eta_lambda))
+    logp_tau = log_half_cauchy(eta_tau)
+    return logp_z + logp_lambda + logp_tau
+
+
+def init_horseshoe_theta(flat_weights):
+    '''theta0 tal que w(theta0) == flat_weights (lambda_j = tau = 1 al inicio).'''
+    n_weights = flat_weights.size
+    return jnp.concatenate([flat_weights, jnp.zeros(n_weights), jnp.zeros(1)])
+
+
+# ---------------------------------------------------------------------------
 # Datos sintéticos
 # ---------------------------------------------------------------------------
 rng = np.random.RandomState(RANDOM_STATE)
@@ -216,38 +279,39 @@ plt.fill_between(
 plt.legend()
 plt.title("MLP con verosimilitud t-Student entrenada con SGD")
 plt.tight_layout()
-plt.savefig("bayesian_neural_net.png", dpi=120)
-print("Gráfica guardada en bayesian_neural_net.png")
+plt.savefig("bayesian_neural_net_horseshoe.png", dpi=120)
+print("Gráfica guardada en bayesian_neural_net_horseshoe.png")
 
 
 # ---------------------------------------------------------------------------
-# Modelo bayesiano: NUTS (littlemcmc) sobre los pesos de un MLP pequeño.
-#
-# Usamos una red más pequeña [1, 8, 3] (43 parámetros) para que el muestreo del
-# posterior sea tratable. La verosimilitud es la misma t-Student y añadimos una
-# previa N(0, 1) débilmente informativa sobre todos los pesos:
-#     log p(w | datos)  =  sum_i  log t(y_i | mu(x_i;w), sigma(x_i;w), nu(x_i;w))
-#                          - 0.5 * ||w||^2
+# Modelo bayesiano: NUTS (littlemcmc) sobre los pesos de un MLP pequeño, con
+# previa horseshoe global-local en vez de la N(0, 1) del script original:
+#     log p(w, lambda, tau | datos) =
+#         sum_i log t(y_i | mu(x_i; w), sigma(x_i; w), nu(x_i; w))
+#         - 0.5 ||z||^2 + sum_j log C+(lambda_j; 0, 1) + log C+(tau; 0, 1)
+#     con w = z * lambda * tau (no centrada, ver comentarios arriba).
+# El vector que efectivamente muestrea NUTS/HMC es theta = [z, eta_lambda, eta_tau],
+# de dimensión 2 * model_ndim + 1 (el doble de parámetros que la previa gaussiana).
 # ---------------------------------------------------------------------------
-PRIOR_SD = 1.0
-
 key_b, random_key = jax.random.split(random_key)
-params_small = init_mlp(key_b, [1, 64,64 , 3])
+params_small = init_mlp(key_b, [1, 64, 64, 3])
 print("\nEntrenando MLP pequeño (SGD) para inicializar NUTS...")
 params_small, _ = train(tstudent_loss, params_small, Xtr, ytr, n_epochs=8000, lr=1e-2)
 
-# Aplanamos el árbol de parámetros a un vector (lo que NUTS muestrea).
+# Aplanamos el árbol de parámetros a un vector (los pesos w, no lo que NUTS muestrea).
 flat0, unflatten = ravel_pytree(params_small)
-model_ndim = int(flat0.size)
+model_ndim = int(flat0.size)                # nº de pesos w
+theta_ndim = 2 * model_ndim + 1             # nº de parámetros que muestrea NUTS/HMC
+theta0 = init_horseshoe_theta(flat0)
 
 
-def log_posterior(flat):
-    '''log-posterior no normalizado del MLP bayesiano.'''
+def log_posterior(theta):
+    '''log-posterior no normalizado del MLP bayesiano con previa horseshoe.'''
+    flat = horseshoe_weights(theta, model_ndim)
     params = unflatten(flat)
     mu, sigma, nu = predict_params(params, Xtr)
     loglik = jnp.sum(tstudent_logpdf(ytr, mu, sigma, nu))
-    logprior = -0.5 * jnp.sum(flat ** 2) / (PRIOR_SD ** 2)
-    return loglik + logprior
+    return loglik + horseshoe_logprior(theta, model_ndim)
 
 
 # Contrato del backend JAX (nuts_jax): q (JAX array) -> (logp escalar, dlogp),
@@ -255,33 +319,37 @@ def log_posterior(flat):
 logp_dlogp_func = value_and_grad(log_posterior)
 
 
-print(f"\nMuestreando el posterior con NUTS-JAX vmapped ({model_ndim} parámetros)...")
+print(f"\nMuestreando el posterior con NUTS-JAX vmapped "
+      f"({model_ndim} pesos, {theta_ndim} parámetros con horseshoe)...")
 trace, stats = sample_vmapped_nuts_chains(
     logp_dlogp_func,
-    model_ndim=model_ndim,
+    model_ndim=theta_ndim,
     draws=400,
     tune=400,
     chains=2,
-    start=flat0,   # (model_ndim,) se difunde a todas las cadenas
+    start=theta0,   # (theta_ndim,) se difunde a todas las cadenas
     random_seed=RANDOM_STATE,
 )
-samples = jnp.asarray(trace.reshape(-1, model_ndim))   # (n_muestras, ndim)
+theta_samples = jnp.asarray(trace.reshape(-1, theta_ndim))                     # (n_muestras, theta_ndim)
+samples = vmap(lambda th: horseshoe_weights(th, model_ndim))(theta_samples)    # (n_muestras, model_ndim)
 n_div = int(np.sum(stats["diverging"]))
 print(f"  muestras posteriores: {samples.shape[0]}  |  divergencias: {n_div}")
 
 
-print(f"\nMuestreando el posterior con HMC-JAX vmapped ({model_ndim} parámetros)...")
+print(f"\nMuestreando el posterior con HMC-JAX vmapped "
+      f"({model_ndim} pesos, {theta_ndim} parámetros con horseshoe)...")
 trace_hmc, stats_hmc = sample_vmapped_chains(
     logp_dlogp_func,
-    model_ndim=model_ndim,
+    model_ndim=theta_ndim,
     draws=400,
     tune=400,
     chains=2,
     n_leapfrog=16,
-    start=flat0,   # (model_ndim,) se difunde a todas las cadenas
+    start=theta0,   # (theta_ndim,) se difunde a todas las cadenas
     random_seed=RANDOM_STATE,
 )
-samples_hmc = jnp.asarray(trace_hmc.reshape(-1, model_ndim))   # (n_muestras, ndim)
+theta_samples_hmc = jnp.asarray(trace_hmc.reshape(-1, theta_ndim))
+samples_hmc = vmap(lambda th: horseshoe_weights(th, model_ndim))(theta_samples_hmc)
 n_div_hmc = int(np.sum(stats_hmc["diverging"]))
 print(f"  muestras posteriores: {samples_hmc.shape[0]}  |  divergencias: {n_div_hmc}")
 
@@ -299,54 +367,82 @@ def print_convergence(name, trace_chains):
     print(f"  {name}: ESS    min={ess.min():.1f}  media={ess.mean():.1f}  max={ess.max():.1f}")
 
 
-print(f"\nDiagnósticos de convergencia (R-hat, ESS) sobre los {model_ndim} parámetros:")
+print(f"\nDiagnósticos de convergencia (R-hat, ESS) sobre los {theta_ndim} "
+      f"parámetros muestreados (theta = [z, eta_lambda, eta_tau]):")
 print_convergence("NUTS", trace)
 print_convergence("HMC ", trace_hmc)
+
+
+def print_shrinkage(name, theta_samples_, n_weights):
+    '''Resume la escala global (tau) y local (lambda_j) estimadas por el horseshoe.
+
+    tau chico => la red completa se encoge hacia 0; lambda_j >> 1 para un peso
+    puntual => ese peso "escapa" del encogimiento global (señal real detectada).
+    '''
+    tau = np.asarray(jnp.exp(theta_samples_[:, 2 * n_weights]))
+    lam = np.asarray(jnp.exp(theta_samples_[:, n_weights:2 * n_weights]))
+    frac_shrunk = float(np.mean((lam * tau[:, None]) < 0.1))
+    print(f"  {name}: tau (global)     mediana={np.median(tau):.4f}  "
+          f"[{np.percentile(tau, 5):.4f}, {np.percentile(tau, 95):.4f}] (IC90%)")
+    print(f"  {name}: lambda_j*tau     mediana={np.median(lam * tau[:, None]):.4f}  "
+          f"|  fracción de pesos con lambda_j*tau < 0.1: {frac_shrunk:.2%}")
+
+
+print("\nEncogimiento horseshoe (posterior de tau y lambda_j * tau):")
+print_shrinkage("NUTS", theta_samples, model_ndim)
+print_shrinkage("HMC ", theta_samples_hmc, model_ndim)
 
 
 # ---------------------------------------------------------------------------
 # Bayesiano de última capa (HMC-JAX): congelamos el cuerpo MAP (todas las capas
 # menos la última) como extractor de características fijo y muestreamos SOLO la
-# última capa lineal. Es mucho más barato (195 vs 4419 parámetros) y captura la
-# mayor parte de la incertidumbre predictiva (last-layer Laplace/Bayes).
-#     log p(W_L, b_L | datos) = sum_i log t(y_i | head(phi(x_i); W_L, b_L)) - 0.5||·||^2
-# con phi(x) = cuerpo MAP congelado.
+# última capa lineal, también con previa horseshoe. Es mucho más barato
+# (2*195+1 vs 2*4483+1 parámetros) y captura la mayor parte de la incertidumbre
+# predictiva (last-layer Laplace/Bayes) mientras muestra el mismo mecanismo de
+# encogimiento a una escala tratable.
+#     log p(W_L, b_L, lambda, tau | datos) =
+#         sum_i log t(y_i | head(phi(x_i); W_L, b_L)) + previa horseshoe
+#     con phi(x) = cuerpo MAP congelado, w_L = z_L * lambda_L * tau_L.
 # ---------------------------------------------------------------------------
 body_params = params_small[:-1]          # capas congeladas (valor MAP)
 last_params = params_small[-1]           # (W_L, b_L): lo único que se muestrea
 flat0_last, unflatten_last = ravel_pytree(last_params)
 model_ndim_last = int(flat0_last.size)
+theta_ndim_last = 2 * model_ndim_last + 1
+theta0_last = init_horseshoe_theta(flat0_last)
 
 # Características de entrenamiento, congeladas (sin gradiente hacia el cuerpo).
 phi_tr = jax.lax.stop_gradient(mlp_features(body_params, Xtr))
 
 
-def log_posterior_last(flat):
-    '''log-posterior no normalizado sobre la última capa (cuerpo congelado).'''
+def log_posterior_last(theta):
+    '''log-posterior no normalizado sobre la última capa (cuerpo congelado), previa horseshoe.'''
+    flat = horseshoe_weights(theta, model_ndim_last)
     W_last, b_last = unflatten_last(flat)
     mu, sigma, nu = predict_params_last(W_last, b_last, phi_tr)
     loglik = jnp.sum(tstudent_logpdf(ytr, mu, sigma, nu))
-    logprior = -0.5 * jnp.sum(flat ** 2) / (PRIOR_SD ** 2)
-    return loglik + logprior
+    return loglik + horseshoe_logprior(theta, model_ndim_last)
 
 
 logp_dlogp_last = value_and_grad(log_posterior_last)
 
 print(f"\nMuestreando SOLO la última capa con HMC-JAX vmapped "
-      f"({model_ndim_last} de {model_ndim} parámetros)...")
+      f"({model_ndim_last} pesos de {model_ndim}, {theta_ndim_last} parámetros con horseshoe)...")
 trace_ll, stats_ll = sample_vmapped_chains(
     logp_dlogp_last,
-    model_ndim=model_ndim_last,
+    model_ndim=theta_ndim_last,
     draws=400,
     tune=400,
     chains=2,
     n_leapfrog=16,
-    start=flat0_last,   # (model_ndim_last,) se difunde a todas las cadenas
+    start=theta0_last,   # (theta_ndim_last,) se difunde a todas las cadenas
     random_seed=RANDOM_STATE,
 )
-samples_ll = jnp.asarray(trace_ll.reshape(-1, model_ndim_last))
+theta_samples_ll = jnp.asarray(trace_ll.reshape(-1, theta_ndim_last))
+samples_ll = vmap(lambda th: horseshoe_weights(th, model_ndim_last))(theta_samples_ll)
 n_div_ll = int(np.sum(stats_ll["diverging"]))
 print(f"  muestras posteriores: {samples_ll.shape[0]}  |  divergencias: {n_div_ll}")
+print_shrinkage("HMC última capa", theta_samples_ll, model_ndim_last)
 
 # Características congeladas en malla y prueba (reutilizadas por las métricas/plot).
 phi_grid = jax.lax.stop_gradient(mlp_features(body_params, Xgrid))
@@ -438,7 +534,9 @@ k1, key_pred = jax.random.split(key_pred)
 det_pred = det_pred_samples(params_tstudent, k1)
 det_cov, det_crps = coverage95(det_pred), crps(det_pred)
 
-# (2) MLP determinista pequeño (SGD/MAP) = la moda del modelo bayesiano.
+# (2) MLP determinista pequeño (SGD/MAP) = la moda de la parte de verosimilitud
+# del modelo bayesiano (no coincide con la moda de la previa horseshoe, que
+# encoge hacia 0; se reporta igualmente como referencia determinista).
 mu_map, sigma_map, nu_map = predict_params(params_small, Xte)
 map_rmse = rmse(np.asarray(mu_map) * y_sd + y_mean)
 map_ll = float(jnp.mean(tstudent_logpdf(yte, mu_map, sigma_map, nu_map)))
@@ -494,33 +592,33 @@ ll_rmse, ll_ll, ll_cov, ll_crps = bayes_metrics(
     samples_ll, k5, test_pred_fn=test_pred_last, pred_samples_fn=lastlayer_pred_samples
 )
 
-print("\n=== Comparación en el conjunto de prueba ===")
+print("\n=== Comparación en el conjunto de prueba (previa horseshoe) ===")
 hdr = f"{'Modelo':<38}{'RMSE':>9}{'log-lik/pto':>13}{'cob.95%':>10}{'CRPS':>9}"
 print(hdr)
 print(f"{'MLP determinista [1,64,64,3] (SGD)':<38}{det_rmse:>9.4f}{det_ll:>13.4f}{det_cov:>10.3f}{det_crps:>9.4f}")
 print(f"{'MLP determinista [1,64,64,3] (MAP)':<38}{map_rmse:>9.4f}{map_ll:>13.4f}{map_cov:>10.3f}{map_crps:>9.4f}")
-print(f"{'Bayesiano completo [1,64,64,3] (NUTS)':<38}{nuts_rmse:>9.4f}{nuts_ll:>13.4f}{nuts_cov:>10.3f}{nuts_crps:>9.4f}")
-print(f"{'Bayesiano completo [1,64,64,3] (HMC)':<38}{hmc_rmse:>9.4f}{hmc_ll:>13.4f}{hmc_cov:>10.3f}{hmc_crps:>9.4f}")
-print(f"{'Bayesiano última capa (HMC, {n} par.)'.format(n=model_ndim_last):<38}{ll_rmse:>9.4f}{ll_ll:>13.4f}{ll_cov:>10.3f}{ll_crps:>9.4f}")
+print(f"{'Bayesiano horseshoe [1,64,64,3] (NUTS)':<38}{nuts_rmse:>9.4f}{nuts_ll:>13.4f}{nuts_cov:>10.3f}{nuts_crps:>9.4f}")
+print(f"{'Bayesiano horseshoe [1,64,64,3] (HMC)':<38}{hmc_rmse:>9.4f}{hmc_ll:>13.4f}{hmc_cov:>10.3f}{hmc_crps:>9.4f}")
+print(f"{'Bayesiano horseshoe última capa (HMC, {n} par.)'.format(n=model_ndim_last):<38}{ll_rmse:>9.4f}{ll_ll:>13.4f}{ll_cov:>10.3f}{ll_crps:>9.4f}")
 print("(log-lik mayor es mejor; CRPS menor es mejor; cobertura 95% ideal ≈ 0.95)")
 
 
 # ---------------------------------------------------------------------------
-# Gráfica comparativa: determinista vs bayesiano (NUTS)
+# Gráfica comparativa: determinista vs bayesiano (NUTS, previa horseshoe)
 # ---------------------------------------------------------------------------
 plt.figure(figsize=(8, 5))
 plt.scatter(X_train, y_train, s=8, alpha=0.2, color="gray", label="datos")
 plt.plot(xx, f(xx), "k--", label="media verdadera")
 plt.plot(xx, mu_grid, "C1", label="MLP determinista (SGD)")
-plt.plot(xx, bayes_mean_grid, "C0", label="Bayesiano NUTS (media posterior)")
-plt.plot(xx, hmc_mean_grid, "C2", label="Bayesiano HMC (media posterior)")
-plt.plot(xx, ll_mean_grid, "C3", label="Bayesiano última capa (media posterior)")
+plt.plot(xx, bayes_mean_grid, "C0", label="Bayesiano NUTS horseshoe (media posterior)")
+plt.plot(xx, hmc_mean_grid, "C2", label="Bayesiano HMC horseshoe (media posterior)")
+plt.plot(xx, ll_mean_grid, "C3", label="Bayesiano última capa horseshoe (media posterior)")
 plt.fill_between(
     xx.ravel(), bayes_lo_grid, bayes_hi_grid,
     color="C0", alpha=0.25, label="IC 95% NUTS (incertidumbre epistémica)"
 )
 plt.legend()
-plt.title("Determinista (SGD) vs Bayesiano (NUTS/HMC/última capa) — t-Student")
+plt.title("Determinista (SGD) vs Bayesiano horseshoe (NUTS/HMC/última capa) — t-Student")
 plt.tight_layout()
-plt.savefig("bayesian_neural_net_nuts.png", dpi=120)
-print("\nGráfica comparativa guardada en bayesian_neural_net_nuts.png")
+plt.savefig("bayesian_neural_net_horseshoe_nuts.png", dpi=120)
+print("\nGráfica comparativa guardada en bayesian_neural_net_horseshoe_nuts.png")
