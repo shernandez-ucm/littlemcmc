@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import matplotlib.pyplot as plt
 import arviz as az
@@ -18,7 +20,6 @@ import distrax
 from tensorflow_probability.substrates import jax as tfp
 tfd = tfp.distributions
 
-from littlemcmc.nuts_jax import sample_vmapped_nuts_chains
 from littlemcmc.hmc_jax import sample_vmapped_chains
 
 RANDOM_STATE = 42   # semilla única para todo el laboratorio (reproducibilidad)
@@ -255,69 +256,26 @@ print("Gráfica guardada en bayesian_neural_net.png")
 
 
 # ---------------------------------------------------------------------------
-# Modelo bayesiano: NUTS (littlemcmc) sobre los pesos de un MLP pequeño.
-#
-# Usamos una red más pequeña [1, 8, 3] (43 parámetros) para que el muestreo del
-# posterior sea tratable. La verosimilitud es la misma t-Student y añadimos una
-# previa N(0, 1) débilmente informativa sobre todos los pesos:
-#     log p(w | datos)  =  sum_i  log t(y_i | mu(x_i;w), sigma(x_i;w), nu(x_i;w))
-#                          - 0.5 * ||w||^2
+# Bayesiano de última capa (HMC/NUTS-JAX): entrenamos un MLP por MAP (SGD) y
+# congelamos el cuerpo como extractor de características fijo; solo la última
+# capa lineal es bayesiana. La verosimilitud es la misma t-Student y añadimos
+# una previa N(0, 1) débilmente informativa sobre los pesos de la última capa:
+#     log p(W_L, b_L | datos) = sum_i log t(y_i | head(phi(x_i); W_L, b_L))
+#                               - 0.5 ||·||^2
+# con phi(x) = cuerpo MAP congelado. Es mucho más barato que muestrear la red
+# completa (195 vs 4419 parámetros) y captura la mayor parte de la incertidumbre
+# predictiva (last-layer Laplace/Bayes).
 # ---------------------------------------------------------------------------
 PRIOR_SD = 1.0
 
 key_b, random_key = jax.random.split(random_key)
 params_small = init_mlp(key_b)
-print("\nEntrenando MLP pequeño (SGD) para inicializar NUTS...")
+print("\nEntrenando MLP pequeño (SGD/MAP) para congelar el cuerpo...")
 params_small, _ = train(tstudent_loss, params_small, Xtr, ytr, n_epochs=8000, lr=1e-2)
 
-# Aplanamos el árbol de parámetros a un vector (lo que NUTS muestrea).
-flat0, unflatten = ravel_pytree(params_small)
+# Nº de pesos totales del MLP (referencia para el conteo de la última capa).
+flat0, _ = ravel_pytree(params_small)
 model_ndim = int(flat0.size)
-
-
-def log_posterior(flat):
-    '''log-posterior no normalizado del MLP bayesiano.'''
-    params = unflatten(flat)
-    mu, sigma, nu = predict_params(params, Xtr)
-    loglik = jnp.sum(tstudent_logpdf(ytr, mu, sigma, nu))
-    logprior = -0.5 * jnp.sum(flat ** 2) / (PRIOR_SD ** 2)
-    return loglik + logprior
-
-
-# Contrato del backend JAX (nuts_jax): q (JAX array) -> (logp escalar, dlogp),
-# todo en JAX (sin np.asarray) para que sea trazable por vmap+jit on-device.
-logp_dlogp_func = value_and_grad(log_posterior)
-
-
-print(f"\nMuestreando el posterior con NUTS-JAX vmapped ({model_ndim} parámetros)...")
-trace, stats = sample_vmapped_nuts_chains(
-    logp_dlogp_func,
-    model_ndim=model_ndim,
-    draws=400,
-    tune=400,
-    chains=2,
-    start=flat0,   # (model_ndim,) se difunde a todas las cadenas
-    random_seed=RANDOM_STATE,
-)
-samples = jnp.asarray(trace.reshape(-1, model_ndim))   # (n_muestras, ndim)
-n_div = int(np.sum(stats["diverging"]))
-print(f"  muestras posteriores: {samples.shape[0]}  |  divergencias: {n_div}")
-
-
-print(f"\nMuestreando el posterior con HMC-JAX vmapped ({model_ndim} parámetros)...")
-trace_hmc, stats_hmc = sample_vmapped_chains(
-    logp_dlogp_func,
-    model_ndim=model_ndim,
-    draws=400,
-    tune=400,
-    chains=2,
-    n_leapfrog=16,
-    start=flat0,   # (model_ndim,) se difunde a todas las cadenas
-    random_seed=RANDOM_STATE,
-)
-samples_hmc = jnp.asarray(trace_hmc.reshape(-1, model_ndim))   # (n_muestras, ndim)
-n_div_hmc = int(np.sum(stats_hmc["diverging"]))
-print(f"  muestras posteriores: {samples_hmc.shape[0]}  |  divergencias: {n_div_hmc}")
 
 
 def print_convergence(name, trace_chains):
@@ -333,18 +291,9 @@ def print_convergence(name, trace_chains):
     print(f"  {name}: ESS    min={ess.min():.1f}  media={ess.mean():.1f}  max={ess.max():.1f}")
 
 
-print(f"\nDiagnósticos de convergencia (R-hat, ESS) sobre los {model_ndim} parámetros:")
-print_convergence("NUTS", trace)
-print_convergence("HMC ", trace_hmc)
-
-
 # ---------------------------------------------------------------------------
-# Bayesiano de última capa (HMC-JAX): congelamos el cuerpo MAP (todas las capas
-# menos la última) como extractor de características fijo y muestreamos SOLO la
-# última capa lineal. Es mucho más barato (195 vs 4419 parámetros) y captura la
-# mayor parte de la incertidumbre predictiva (last-layer Laplace/Bayes).
-#     log p(W_L, b_L | datos) = sum_i log t(y_i | head(phi(x_i); W_L, b_L)) - 0.5||·||^2
-# con phi(x) = cuerpo MAP congelado.
+# Muestreo de la última capa: cuerpo MAP congelado como extractor de
+# características phi(x); solo se muestrean (W_L, b_L).
 # ---------------------------------------------------------------------------
 body_params = params_small["body"]       # capas congeladas (valor MAP)
 last_params = params_small["head"]       # cabeza (MLPHead): lo único que se muestrea
@@ -368,19 +317,28 @@ logp_dlogp_last = value_and_grad(log_posterior_last)
 
 print(f"\nMuestreando SOLO la última capa con HMC-JAX vmapped "
       f"({model_ndim_last} de {model_ndim} parámetros)...")
+t0 = time.perf_counter()
 trace_ll, stats_ll = sample_vmapped_chains(
     logp_dlogp_last,
     model_ndim=model_ndim_last,
-    draws=400,
-    tune=400,
+    draws=1500,
+    tune=1500,
     chains=2,
     n_leapfrog=16,
     start=flat0_last,   # (model_ndim_last,) se difunde a todas las cadenas
     random_seed=RANDOM_STATE,
 )
+jax.block_until_ready(trace_ll)   # espera al cómputo asíncrono antes de cronometrar
+ll_time = time.perf_counter() - t0
 samples_ll = jnp.asarray(trace_ll.reshape(-1, model_ndim_last))
 n_div_ll = int(np.sum(stats_ll["diverging"]))
-print(f"  muestras posteriores: {samples_ll.shape[0]}  |  divergencias: {n_div_ll}")
+# draws/s = muestras posteriores / tiempo de pared (incluye warmup y compilación JIT)
+print(f"  muestras posteriores: {samples_ll.shape[0]}  |  divergencias: {n_div_ll}  "
+      f"|  {samples_ll.shape[0] / ll_time:.1f} draws/s ({ll_time:.1f}s)")
+
+print(f"\nDiagnósticos de convergencia (R-hat, ESS) sobre los {model_ndim_last} "
+      f"parámetros de la última capa:")
+print_convergence("HMC última capa", trace_ll)
 
 # Características congeladas en malla y prueba (reutilizadas por las métricas/plot).
 phi_grid = jax.lax.stop_gradient(mlp_features(body_params, Xgrid))
@@ -388,28 +346,16 @@ phi_te = jax.lax.stop_gradient(mlp_features(body_params, Xte))
 
 
 # --- Predicción posterior (posterior predictive) sobre la malla -------------
-def grid_mu(flat):
-    mu, _, _ = predict_params(unflatten(flat), Xgrid)
-    return mu
-
-
-post_mu_grid = vmap(grid_mu)(samples) * y_sd + y_mean        # (S, G) en unidades reales
-bayes_mean_grid = np.asarray(jnp.mean(post_mu_grid, axis=0))
-bayes_lo_grid = np.asarray(jnp.percentile(post_mu_grid, 2.5, axis=0))
-bayes_hi_grid = np.asarray(jnp.percentile(post_mu_grid, 97.5, axis=0))
-
-post_mu_grid_hmc = vmap(grid_mu)(samples_hmc) * y_sd + y_mean
-hmc_mean_grid = np.asarray(jnp.mean(post_mu_grid_hmc, axis=0))
-
-
 def grid_mu_last(flat):
     head_params = unflatten_last(flat)
     mu, _, _ = predict_params_last(head_params, phi_grid)
     return mu
 
 
-post_mu_grid_ll = vmap(grid_mu_last)(samples_ll) * y_sd + y_mean
+post_mu_grid_ll = vmap(grid_mu_last)(samples_ll) * y_sd + y_mean   # (S, G) en unidades reales
 ll_mean_grid = np.asarray(jnp.mean(post_mu_grid_ll, axis=0))
+ll_lo_grid = np.asarray(jnp.percentile(post_mu_grid_ll, 2.5, axis=0))
+ll_hi_grid = np.asarray(jnp.percentile(post_mu_grid_ll, 97.5, axis=0))
 
 
 # ---------------------------------------------------------------------------
@@ -452,18 +398,6 @@ def det_pred_samples(params, key, n=N_PRED):
     return ys * y_sd + y_mean
 
 
-def bayes_pred_samples(post_samples, key):
-    '''Muestras de la predictiva posterior (una y por muestra posterior y punto), unidades reales.'''
-    keys = jax.random.split(key, post_samples.shape[0])
-
-    def one(flat, k):
-        mu, sigma, nu = predict_params(unflatten(flat), Xte)
-        return tstudent_rvs(k, mu, sigma, nu)
-
-    ys = vmap(one)(post_samples, keys)                                       # (S, N_test)
-    return ys * y_sd + y_mean
-
-
 # (1) MLP determinista grande (SGD, [1,64,64,3]).
 mu_det, sigma_det, nu_det = predict_params(params_tstudent, Xte)
 det_rmse = rmse(np.asarray(mu_det) * y_sd + y_mean)
@@ -481,14 +415,8 @@ map_pred = det_pred_samples(params_small, k2)
 map_cov, map_crps = coverage95(map_pred), crps(map_pred)
 
 
-# (3)/(4)/(5) Modelos bayesianos (NUTS, HMC, última capa): media y verosimilitud
-# predictiva posterior. `test_pred_fn` y `pred_samples_fn` desacoplan la red
-# completa del esquema de última capa (cuerpo congelado).
-def test_pred(flat):
-    mu, sigma, nu = predict_params(unflatten(flat), Xte)
-    return mu, tstudent_logpdf(yte, mu, sigma, nu)
-
-
+# (3) Modelo bayesiano de última capa (HMC): media y verosimilitud predictiva
+# posterior sobre la cabeza muestreada (cuerpo MAP congelado).
 def test_pred_last(flat):
     head_params = unflatten_last(flat)
     mu, sigma, nu = predict_params_last(head_params, phi_te)
@@ -508,8 +436,7 @@ def lastlayer_pred_samples(post_samples, key):
     return ys * y_sd + y_mean
 
 
-def bayes_metrics(post_samples, key, test_pred_fn=test_pred,
-                  pred_samples_fn=bayes_pred_samples):
+def bayes_metrics(post_samples, key, test_pred_fn, pred_samples_fn):
     post_mu_test, post_lp_test = vmap(test_pred_fn)(post_samples)   # (S, N_test) cada uno
     mu_test = jnp.mean(post_mu_test, axis=0) * y_sd + y_mean
     S = post_samples.shape[0]
@@ -520,12 +447,8 @@ def bayes_metrics(post_samples, key, test_pred_fn=test_pred,
 
 
 k3, key_pred = jax.random.split(key_pred)
-nuts_rmse, nuts_ll, nuts_cov, nuts_crps = bayes_metrics(samples, k3)
-k4, key_pred = jax.random.split(key_pred)
-hmc_rmse, hmc_ll, hmc_cov, hmc_crps = bayes_metrics(samples_hmc, k4)
-k5, key_pred = jax.random.split(key_pred)
 ll_rmse, ll_ll, ll_cov, ll_crps = bayes_metrics(
-    samples_ll, k5, test_pred_fn=test_pred_last, pred_samples_fn=lastlayer_pred_samples
+    samples_ll, k3, test_pred_last, lastlayer_pred_samples
 )
 
 print("\n=== Comparación en el conjunto de prueba ===")
@@ -533,28 +456,24 @@ hdr = f"{'Modelo':<38}{'RMSE':>9}{'log-lik/pto':>13}{'cob.95%':>10}{'CRPS':>9}"
 print(hdr)
 print(f"{'MLP determinista [1,64,64,3] (SGD)':<38}{det_rmse:>9.4f}{det_ll:>13.4f}{det_cov:>10.3f}{det_crps:>9.4f}")
 print(f"{'MLP determinista [1,64,64,3] (MAP)':<38}{map_rmse:>9.4f}{map_ll:>13.4f}{map_cov:>10.3f}{map_crps:>9.4f}")
-print(f"{'Bayesiano completo [1,64,64,3] (NUTS)':<38}{nuts_rmse:>9.4f}{nuts_ll:>13.4f}{nuts_cov:>10.3f}{nuts_crps:>9.4f}")
-print(f"{'Bayesiano completo [1,64,64,3] (HMC)':<38}{hmc_rmse:>9.4f}{hmc_ll:>13.4f}{hmc_cov:>10.3f}{hmc_crps:>9.4f}")
 print(f"{'Bayesiano última capa (HMC, {n} par.)'.format(n=model_ndim_last):<38}{ll_rmse:>9.4f}{ll_ll:>13.4f}{ll_cov:>10.3f}{ll_crps:>9.4f}")
 print("(log-lik mayor es mejor; CRPS menor es mejor; cobertura 95% ideal ≈ 0.95)")
 
 
 # ---------------------------------------------------------------------------
-# Gráfica comparativa: determinista vs bayesiano (NUTS)
+# Gráfica comparativa: determinista (SGD) vs bayesiano de última capa (HMC)
 # ---------------------------------------------------------------------------
 plt.figure(figsize=(8, 5))
 plt.scatter(X_train, y_train, s=8, alpha=0.2, color="gray", label="datos")
 plt.plot(xx, f(xx), "k--", label="media verdadera")
 plt.plot(xx, mu_grid, "C1", label="MLP determinista (SGD)")
-plt.plot(xx, bayes_mean_grid, "C0", label="Bayesiano NUTS (media posterior)")
-plt.plot(xx, hmc_mean_grid, "C2", label="Bayesiano HMC (media posterior)")
 plt.plot(xx, ll_mean_grid, "C3", label="Bayesiano última capa (media posterior)")
 plt.fill_between(
-    xx.ravel(), bayes_lo_grid, bayes_hi_grid,
-    color="C0", alpha=0.25, label="IC 95% NUTS (incertidumbre epistémica)"
+    xx.ravel(), ll_lo_grid, ll_hi_grid,
+    color="C3", alpha=0.25, label="IC 95% última capa (incertidumbre epistémica)"
 )
 plt.legend()
-plt.title("Determinista (SGD) vs Bayesiano (NUTS/HMC/última capa) — t-Student")
+plt.title("Determinista (SGD) vs Bayesiano de última capa (HMC) — t-Student")
 plt.tight_layout()
 plt.savefig("bayesian_neural_net_nuts.png", dpi=120)
 print("\nGráfica comparativa guardada en bayesian_neural_net_nuts.png")
